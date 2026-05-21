@@ -1198,3 +1198,94 @@ class TestWarnIfTooLong:
         asyncio.run(run())
         assert len(warn_calls) == 1
         assert warn_calls[0] == "Hello world"
+
+
+# ---------------------------------------------------------------------------
+# Regression: PR #1192 — greedy_until iterates split, not full dataset
+# ---------------------------------------------------------------------------
+
+
+class TestGreedyUntilSplitFix:
+    """Regression test: greedy_until must build contexts from the current split only.
+
+    The bug: `contexts = [prepare_prompt_api(doc) for doc in dataset]` iterated
+    the entire dataset on every split iteration, causing each doc to be processed
+    `num_splits` times instead of once.  The fix uses `for doc in split`.
+    """
+
+    def _make_greedy_doc(self, query, generation_size=32, doc_id="0"):
+        doc = Doc(query=query, choices=[], gold_index=0, task_name="test", generation_size=generation_size)
+        doc.id = doc_id
+        return doc
+
+    def _make_chat_response(self, content="answer"):
+        choice = MagicMock()
+        choice.message.content = content
+        choice.message.reasoning_content = None
+        resp = MagicMock()
+        resp.choices = [choice]
+        return resp
+
+    def test_each_doc_prepared_exactly_once_across_two_splits(self):
+        """Docs with different generation_size land in separate splits.
+        prepare_prompt_api must be called once per doc, not once per split × N docs.
+        """
+        client = make_bare_client()
+
+        # Different generation_size → GenerativeTaskDataset puts them in different splits
+        doc_a = self._make_greedy_doc("Prompt A", generation_size=16, doc_id="a")
+        doc_b = self._make_greedy_doc("Prompt B", generation_size=32, doc_id="b")
+        docs = [doc_a, doc_b]
+
+        prepared = []
+
+        def tracking_prepare(doc):
+            prepared.append(doc.query)
+            return [{"role": "user", "content": doc.query}]
+
+        client.prompt_manager.prepare_prompt_api.side_effect = tracking_prepare
+
+        def fake_parallel(contexts, *args, **kwargs):
+            return [self._make_chat_response() for _ in contexts]
+
+        with patch.object(
+            client, "_LiteLLMClient__call_api_parallel", side_effect=fake_parallel
+        ), patch.object(type(client), "disable_tqdm", new_callable=PropertyMock, return_value=True):
+            results = client.greedy_until(docs)
+
+        assert len(prepared) == 2, (
+            f"Expected 2 prepare_prompt_api calls (one per doc), got {len(prepared)}. "
+            "Regression: greedy_until iterated full dataset instead of current split."
+        )
+        assert set(prepared) == {"Prompt A", "Prompt B"}
+        assert len(results) == 2
+
+    def test_single_split_all_docs_processed(self):
+        """Sanity: one split (same generation_size) — all docs processed correctly."""
+        client = make_bare_client()
+
+        docs = [
+            self._make_greedy_doc("Prompt A", generation_size=32, doc_id="a"),
+            self._make_greedy_doc("Prompt B", generation_size=32, doc_id="b"),
+            self._make_greedy_doc("Prompt C", generation_size=32, doc_id="c"),
+        ]
+
+        prepared = []
+
+        def tracking_prepare(doc):
+            prepared.append(doc.query)
+            return [{"role": "user", "content": doc.query}]
+
+        client.prompt_manager.prepare_prompt_api.side_effect = tracking_prepare
+
+        def fake_parallel(contexts, *args, **kwargs):
+            return [self._make_chat_response() for _ in contexts]
+
+        with patch.object(
+            client, "_LiteLLMClient__call_api_parallel", side_effect=fake_parallel
+        ), patch.object(type(client), "disable_tqdm", new_callable=PropertyMock, return_value=True):
+            results = client.greedy_until(docs)
+
+        assert len(prepared) == 3
+        assert set(prepared) == {"Prompt A", "Prompt B", "Prompt C"}
+        assert len(results) == 3
