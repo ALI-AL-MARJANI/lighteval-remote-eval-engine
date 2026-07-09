@@ -103,6 +103,12 @@ class LiteLLMModelConfig(ModelConfig):
         system_prompt (str | None, optional, defaults to None): Optional system prompt to be used with chat models.
             This prompt sets the behavior and context for the model during evaluation.
         cache_dir (str, optional, defaults to "~/.cache/huggingface/lighteval"): Directory to cache the model.
+        use_chat_template (bool, optional, defaults to True): Whether to format prompts as multi-turn
+            chat messages (``role``/``content`` dicts sent to ``/chat/completions``). Set to ``False``
+            for base / completion-only models: prompts (including few-shot examples) are then
+            concatenated into a single plain-text block, matching how ``loglikelihood`` already
+            builds its prompts. This has no effect on ``loglikelihood``/``loglikelihood_rolling``,
+            which always use plain text since they require the ``/v1/completions`` endpoint.
 
     Supported evaluation modes:
         - ``greedy_until`` (generative): all models and providers supported.
@@ -131,6 +137,13 @@ class LiteLLMModelConfig(ModelConfig):
             concurrent_requests=10,
             generation_parameters=GenerationParameters(seed=42),
         )
+
+        # Base / completion-only model: plain-text prompts instead of chat messages
+        config = LiteLLMModelConfig(
+            model_name="hosted_vllm/my-base-model",
+            base_url="http://localhost:8000/v1",
+            use_chat_template=False,
+        )
         ```
     """
 
@@ -146,6 +159,7 @@ class LiteLLMModelConfig(ModelConfig):
     api_retry_sleep: float = 1.0
     api_retry_multiplier: float = 2.0
     timeout: float | None = None
+    use_chat_template: bool = True
 
 
 @requires("litellm")
@@ -175,7 +189,7 @@ class LiteLLMClient(LightevalModel):
         litellm.drop_params = True
         litellm.verbose = config.verbose
         self.prompt_manager = PromptManager(
-            use_chat_template=True, tokenizer=self.tokenizer, system_prompt=config.system_prompt
+            use_chat_template=config.use_chat_template, tokenizer=self.tokenizer, system_prompt=config.system_prompt
         )
 
         # Initialize cache for tokenization and predictions
@@ -363,7 +377,12 @@ class LiteLLMClient(LightevalModel):
             position=0,
             disable=self.disable_tqdm,
         ):
-            contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in split]
+            contexts = [
+                self.prompt_manager.prepare_prompt_api(doc)
+                if self.prompt_manager.use_chat_template
+                else [{"role": "user", "content": self.prompt_manager._prepare_plain_text(doc)}]
+                for doc in split
+            ]
             max_new_tokens = split[0].generation_size  # could be none
             return_logits = split[0].use_logits
             num_samples = split[0].num_samples

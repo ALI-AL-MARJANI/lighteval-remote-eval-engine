@@ -28,6 +28,7 @@ Async helpers are exercised via asyncio.run() to remain dependency-free
 """
 
 import asyncio
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -42,7 +43,7 @@ pytestmark = pytest.mark.skipif(
     reason="litellm not installed — run `pip install lighteval[litellm]` to enable these tests",
 )
 
-from lighteval.models.endpoints.litellm_model import LiteLLMClient  # noqa: E402
+from lighteval.models.endpoints.litellm_model import LiteLLMClient, LiteLLMModelConfig  # noqa: E402
 from lighteval.models.model_output import ModelResponse  # noqa: E402
 from lighteval.tasks.requests import Doc  # noqa: E402
 
@@ -1289,3 +1290,84 @@ class TestGreedyUntilSplitFix:
         assert len(prepared) == 3
         assert set(prepared) == {"Prompt A", "Prompt B", "Prompt C"}
         assert len(results) == 3
+
+
+# ---------------------------------------------------------------------------
+# use_chat_template config (issue #1093): configurable chat-vs-plain-text
+# prompt formatting, previously hardcoded to True and inert for greedy_until.
+# ---------------------------------------------------------------------------
+
+
+class TestUseChatTemplateConfig:
+    def test_config_defaults_to_true(self):
+        config = LiteLLMModelConfig(model_name="gpt-3.5-turbo-instruct")
+        assert config.use_chat_template is True
+
+    def test_config_threads_through_to_prompt_manager_true(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = LiteLLMModelConfig(model_name="gpt-3.5-turbo-instruct", cache_dir=temp_dir)
+            client = LiteLLMClient(config)
+            assert client.prompt_manager.use_chat_template is True
+
+    def test_config_threads_through_to_prompt_manager_false(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = LiteLLMModelConfig(
+                model_name="hosted_vllm/base-model", use_chat_template=False, cache_dir=temp_dir
+            )
+            client = LiteLLMClient(config)
+            assert client.prompt_manager.use_chat_template is False
+
+    def _make_greedy_doc(self, query, generation_size=32, doc_id="0"):
+        doc = Doc(query=query, choices=[], gold_index=0, task_name="test", generation_size=generation_size)
+        doc.id = doc_id
+        return doc
+
+    def _make_chat_response(self, content="answer"):
+        choice = MagicMock()
+        choice.message.content = content
+        choice.message.reasoning_content = None
+        resp = MagicMock()
+        resp.choices = [choice]
+        return resp
+
+    def test_greedy_until_uses_chat_messages_when_true(self):
+        """Default behavior: prepare_prompt_api (multi-turn messages) is used."""
+        client = make_bare_client()
+        client.prompt_manager.use_chat_template = True
+        client.prompt_manager.prepare_prompt_api = MagicMock(
+            side_effect=lambda doc: [{"role": "user", "content": doc.query}]
+        )
+        doc = self._make_greedy_doc("Prompt A")
+
+        def fake_parallel(contexts, *args, **kwargs):
+            return [self._make_chat_response() for _ in contexts]
+
+        with patch.object(
+            client, "_LiteLLMClient__call_api_parallel", side_effect=fake_parallel
+        ) as call_parallel, patch.object(type(client), "disable_tqdm", new_callable=PropertyMock, return_value=True):
+            client.greedy_until([doc])
+
+        client.prompt_manager.prepare_prompt_api.assert_called_once_with(doc)
+        contexts_sent = call_parallel.call_args[0][0]
+        assert contexts_sent == [[{"role": "user", "content": "Prompt A"}]]
+
+    def test_greedy_until_uses_plain_text_when_false(self):
+        """use_chat_template=False: a single-user-message wrapping the plain-text
+        prompt is sent instead — prepare_prompt_api must not be called at all.
+        """
+        client = make_bare_client()
+        client.prompt_manager.use_chat_template = False
+        client.prompt_manager._prepare_plain_text = lambda doc: f"plain: {doc.query}"
+        doc = self._make_greedy_doc("Prompt A")
+
+        def fake_parallel(contexts, *args, **kwargs):
+            return [self._make_chat_response() for _ in contexts]
+
+        with patch.object(
+            client, "_LiteLLMClient__call_api_parallel", side_effect=fake_parallel
+        ) as call_parallel, patch.object(type(client), "disable_tqdm", new_callable=PropertyMock, return_value=True):
+            client.greedy_until([doc])
+
+        client.prompt_manager.prepare_prompt_api.assert_not_called()
+        contexts_sent = call_parallel.call_args[0][0]
+        assert contexts_sent == [[{"role": "user", "content": "plain: Prompt A"}]]

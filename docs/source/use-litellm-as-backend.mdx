@@ -27,6 +27,18 @@ lighteval endpoint litellm \
     gsm8k
 ```
 
+By default, prompts (including few-shot examples) are formatted as multi-turn
+chat messages. For base / completion-only models that don't expect a chat
+format, set `use_chat_template: false` to concatenate everything into a single
+plain-text prompt instead:
+
+```yaml
+model_parameters:
+    model_name: "hosted_vllm/my-base-model"
+    base_url: "http://localhost:8000/v1"
+    use_chat_template: false
+```
+
 ### Log-likelihood evaluation — completion-capable models only
 
 MCQ benchmarks (MMLU, ARC, HellaSwag, …) and perplexity benchmarks require
@@ -167,3 +179,13 @@ underlying API call.
 | `repetition_penalty` | ✅ | ❌ (not part of `/v1/completions`) |
 
 For more detailed error handling and debugging, refer to the [LiteLLM documentation](https://docs.litellm.ai/docs/).
+
+## Troubleshooting
+
+**My requests never go above ~100 concurrent, even though I set `concurrent_requests` higher.**
+Lighteval forwards `concurrent_requests` as-is (via a `ThreadPoolExecutor` for
+`greedy_until` and an `asyncio.Semaphore` for `loglikelihood`) with no cap of
+its own. If you're not seeing the concurrency you configured, the limit is
+coming from the LiteLLM client or your provider/server itself — see
+[BerriAI/litellm#17688](https://github.com/BerriAI/litellm/issues/17688) for a
+known case of this with locally-hosted vLLM servers.
