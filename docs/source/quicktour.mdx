@@ -118,6 +118,25 @@ lighteval vllm \
     --reasoning-tags="[('[THINK]','[/THINK]')]"
 ```
 
+That controls the *output* side (stripping thinking tokens after generation).
+To control the *input* side — whether the model thinks at all — pass
+`chat_template_kwargs` in your model config. It forwards arbitrary keyword
+arguments to the tokenizer's `apply_chat_template`, which is how models like
+Qwen3 expose an `enable_thinking` switch in their chat template:
+
+```yaml
+model_parameters:
+    model_name: "Qwen/Qwen3-8B"
+    chat_template_kwargs:
+      enable_thinking: false
+```
+
+This is supported by every backend that renders prompts with a local
+tokenizer (`accelerate`/`transformers`, `vllm`, `sglang`, and the
+`endpoint`/`tgi` backends). It has no effect on backends that never apply a
+chat template locally (e.g. `litellm`), since those send raw messages to the
+provider's own API instead.
+
 ### Nanotron
 
 To evaluate a model trained with Nanotron on a single GPU:
